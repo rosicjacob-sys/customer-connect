@@ -1,0 +1,362 @@
+--- a/config.py
++++ b/config.py
+@@ -305,6 +305,13 @@
+     DEEP2K_PAYMENT_SECRET: str = ""
+     DEEP2K_CUSTOMER_IDENTITY_SECRET: str = ""
+ 
++    # ─── Customer Connect (email campaigns) ─────────────────────────────
++    # Paid orders' customers are sent there (services/customer_connect.py).
++    # Blank disables cleanly. The secret must equal Customer Connect's
++    # CHECKOUT_PORTAL_SECRET.
++    CUSTOMER_CONNECT_URL: str = ""
++    CUSTOMER_CONNECT_SECRET: str = ""
++
+     @property
+     def DATABASE_URL(self) -> str:
+         # DB_URL, if set, is a full connection string (Render/Neon convention)
+--- a/database.py
++++ b/database.py
+@@ -57,3 +57,5 @@
+ # SQLAlchemy Session listeners for both the web app and the Celery worker,
+ # so every paid transition reports to Deep2K exactly once, on commit.
+ import services.deep2k_hook  # noqa: E402,F401
++# Same for Customer Connect: every paid order's customer is sent there.
++import services.customer_connect_hook  # noqa: E402,F401
+--- a/tasks/celery_app.py
++++ b/tasks/celery_app.py
+@@ -458,3 +458,31 @@
+             return {"order_id": order_id, "status": "not_found"}
+         await deep2k.report_paid_order(order)
+     return {"order_id": order_id, "status": "reported"}
++
++
++# ─── Task: send a paid order's customer to Customer Connect ─────────────────
++# Enqueued by services/customer_connect_hook.py when an order becomes paid.
++# Unlike the Deep2K report this retries: a customer missed here would never
++# get Customer Connect's emails. Backoff 1, 2, 4 … 64 minutes, then gives up
++# (scripts/customer_connect_backfill.py can resend any period).
++@app.task(name="tasks.celery_app.report_paid_to_customer_connect", bind=True, max_retries=7)
++def report_paid_to_customer_connect(self, order_id: str):
++    try:
++        return _run_async(_do_report_paid_to_customer_connect(order_id))
++    except Exception as exc:
++        logger.warning("[customer_connect] send failed for %s: %s", order_id, exc)
++        raise self.retry(exc=exc, countdown=60 * 2 ** self.request.retries)
++
++
++async def _do_report_paid_to_customer_connect(order_id: str):
++    from database import AsyncSessionLocal
++    from services import customer_connect
++
++    if not customer_connect.is_enabled():
++        return {"order_id": order_id, "status": "disabled"}
++    async with AsyncSessionLocal() as db:
++        payloads = await customer_connect.load_paid_order_payloads(db, [order_id])
++    if not payloads:
++        return {"order_id": order_id, "status": "not_found_or_not_paid"}
++    result = await customer_connect.send_orders(payloads)
++    return {"order_id": order_id, "status": "sent", "saved": result.get("saved")}
+--- a/services/customer_connect.py
++++ b/services/customer_connect.py
+@@ -0,0 +1,114 @@
++"""
++Customer Connect client: sends paid orders' customers to Customer Connect,
++the email-campaign app, so they can get its promo emails.
++
++What is sent per order: email, first/last name, phone, the storefront the
++order came from (source_domain, falling back to the brand's domain), the
++store name, and when it was paid. Customer Connect cleans the data and keeps
++one customer per email, linked to the store of their latest order.
++
++Design notes
++------------
++* Never on the payment path. Orders are queued by the ORM hook
++  (services/customer_connect_hook.py) and sent by a Celery task, which
++  retries while Customer Connect is unreachable. A failure here never
++  blocks or fails a sale.
++* Signed: X-CC-Timestamp + X-CC-Signature (hex HMAC-SHA256 of
++  "<timestamp>.<body>") with the secret both apps share. The body is
++  serialised once and those exact bytes are both signed and sent.
++* Sending the same order twice is harmless: Customer Connect only keeps the
++  latest store per customer.
++
++Environment
++-----------
++CUSTOMER_CONNECT_URL     e.g. https://connect.yourdomain.com  (blank = off)
++CUSTOMER_CONNECT_SECRET  must equal Customer Connect's CHECKOUT_PORTAL_SECRET
++"""
++
++from __future__ import annotations
++
++import hashlib
++import hmac
++import json
++import logging
++import time
++from datetime import datetime, timezone
++from typing import Any, Iterable
++
++import httpx
++
++from config import settings
++
++logger = logging.getLogger(__name__)
++
++_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
++BATCH_SIZE = 500
++
++
++def is_enabled() -> bool:
++    return bool(getattr(settings, "CUSTOMER_CONNECT_URL", "") and getattr(settings, "CUSTOMER_CONNECT_SECRET", ""))
++
++
++def _iso(dt: datetime | None) -> str | None:
++    """The portal stores naive datetimes; they are UTC."""
++    if dt is None:
++        return None
++    if dt.tzinfo is None:
++        dt = dt.replace(tzinfo=timezone.utc)
++    return dt.isoformat(timespec="seconds")
++
++
++def order_payload(order: Any, brand_domain: str | None = None) -> dict[str, Any]:
++    """One order → the fields Customer Connect needs. Cleaning (typos, test
++    emails, checkout-portal domains) happens on the Customer Connect side."""
++    return {
++        "order_id": order.id,
++        "email": (order.email or "").strip(),
++        "first_name": (order.first_name or "").strip(),
++        "last_name": (order.last_name or "").strip(),
++        "phone": (order.phone or "").strip(),
++        "store_domain": (getattr(order, "source_domain", None) or brand_domain or "").strip(),
++        "store_name": (order.store_name or "").strip(),
++        "paid_at": _iso(order.paid_at or order.created_at),
++    }
++
++
++def sign(body: bytes, timestamp: int, secret: str) -> str:
++    return hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
++
++
++async def send_orders(payloads: Iterable[dict[str, Any]]) -> dict[str, Any]:
++    """POST up to BATCH_SIZE orders. Raises on any failure so the caller
++    (Celery task or backfill script) can retry."""
++    orders = list(payloads)
++    if not orders:
++        return {"received": 0}
++    if not is_enabled():
++        raise RuntimeError("Customer Connect is not configured (CUSTOMER_CONNECT_URL / CUSTOMER_CONNECT_SECRET)")
++    body = json.dumps({"orders": orders}, separators=(",", ":"), ensure_ascii=False).encode()
++    ts = int(time.time())
++    url = settings.CUSTOMER_CONNECT_URL.rstrip("/") + "/api/ingest/checkout"
++    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
++        resp = await client.post(url, content=body, headers={
++            "Content-Type": "application/json",
++            "X-CC-Timestamp": str(ts),
++            "X-CC-Signature": sign(body, ts, settings.CUSTOMER_CONNECT_SECRET),
++        })
++    if resp.status_code >= 300:
++        raise RuntimeError(f"Customer Connect answered {resp.status_code}: {resp.text[:300]}")
++    return resp.json()
++
++
++async def load_paid_order_payloads(db, order_ids: list[str]) -> list[dict[str, Any]]:
++    """Paid orders by id, with the brand's domain as a fallback store."""
++    from sqlalchemy import select
++    from models.brand import Brand
++    from models.order import Order, PaymentStatus
++
++    result = await db.execute(
++        select(Order, Brand.domain)
++        .join(Brand, Brand.id == Order.brand_id, isouter=True)
++        .where(Order.id.in_(order_ids))
++        .where(Order.payment_status.in_([PaymentStatus.paid, PaymentStatus.manual]))
++    )
++    return [order_payload(order, brand_domain) for order, brand_domain in result.all()]
+--- a/services/customer_connect_hook.py
++++ b/services/customer_connect_hook.py
+@@ -0,0 +1,78 @@
++"""
++"An order became paid" hook for Customer Connect.
++
++Same approach as services/deep2k_hook.py: listen at the ORM layer, so every
++path that marks an order paid (webhooks, Celery polls, admin manual
++mark-paid, Interac/Zelle matching) is covered, present and future. When an
++Order's payment_status changes to paid or manual and that change is
++COMMITTED, a Celery task is queued to send the customer to Customer Connect.
++
++Activated by importing this module once at startup (done from database.py).
++Never raises into application code: a Customer Connect problem must never
++break a sale. Does nothing while CUSTOMER_CONNECT_URL is blank.
++"""
++import logging
++
++from sqlalchemy import event, inspect as sa_inspect
++from sqlalchemy.orm import Session
++
++logger = logging.getLogger(__name__)
++
++_PENDING_KEY = "_customer_connect_paid_order_ids"
++_PAID = ("paid", "manual")
++
++
++def _is_paid(value) -> bool:
++    # payment_status may be a PaymentStatus str-enum or a plain string.
++    return getattr(value, "value", value) in _PAID
++
++
++def _enqueue(order_id: str) -> None:
++    from services import customer_connect
++    if not customer_connect.is_enabled():
++        return
++    from tasks.celery_app import report_paid_to_customer_connect
++    report_paid_to_customer_connect.apply_async(args=[order_id])
++
++
++@event.listens_for(Session, "before_flush")
++def _cc_capture_paid(session, flush_context, instances):
++    """Record ids of orders becoming paid while attribute history is intact."""
++    try:
++        from models.order import Order
++    except Exception:
++        return
++    bucket = session.info.setdefault(_PENDING_KEY, set())
++    for obj in session.dirty:
++        if not isinstance(obj, Order):
++            continue
++        hist = sa_inspect(obj).attrs.payment_status.history
++        if hist.added and _is_paid(hist.added[0]):
++            was_paid = bool(hist.deleted) and _is_paid(hist.deleted[0])
++            if not was_paid and getattr(obj, "id", None):
++                bucket.add(obj.id)
++    for obj in session.new:
++        if isinstance(obj, Order) and _is_paid(getattr(obj, "payment_status", None)):
++            if getattr(obj, "id", None):
++                bucket.add(obj.id)
++
++
++@event.listens_for(Session, "after_commit")
++def _cc_dispatch_paid(session):
++    """Only after the transaction is durably committed, so a rolled-back
++    'paid' never reaches Customer Connect."""
++    ids = session.info.pop(_PENDING_KEY, None)
++    if not ids:
++        return
++    for order_id in ids:
++        if not order_id:
++            continue
++        try:
++            _enqueue(order_id)
++        except Exception:
++            logger.exception("customer_connect: could not enqueue %s", order_id)
++
++
++@event.listens_for(Session, "after_rollback")
++def _cc_clear(session):
++    session.info.pop(_PENDING_KEY, None)
+--- a/scripts/customer_connect_backfill.py
++++ b/scripts/customer_connect_backfill.py
+@@ -0,0 +1,103 @@
++"""
++Send past paid orders' customers to Customer Connect, once, so its customer
++list starts complete. New paid orders are sent automatically by the hook in
++services/customer_connect_hook.py; this is only for the orders before it.
++
++Safe to run more than once: Customer Connect keeps one customer per email,
++linked to the store of their latest order, whatever order they arrive in.
++
++Needs CUSTOMER_CONNECT_URL and CUSTOMER_CONNECT_SECRET in the environment,
++and the same database settings as the app.
++
++Usage, from the checkout-server directory:
++
++    python scripts/customer_connect_backfill.py --all
++    python scripts/customer_connect_backfill.py --since 2026-01-01
++    python scripts/customer_connect_backfill.py --since 2026-10-01 --until 2026-10-18
++    python scripts/customer_connect_backfill.py --all --dry-run
++"""
++
++from __future__ import annotations
++
++import argparse
++import asyncio
++import os
++import sys
++from datetime import datetime, timedelta
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from sqlalchemy import select  # noqa: E402
++
++from database import AsyncSessionLocal  # noqa: E402
++from models.brand import Brand  # noqa: E402
++from models.order import Order, PaymentStatus  # noqa: E402
++from services import customer_connect  # noqa: E402
++
++PAID = (PaymentStatus.paid, PaymentStatus.manual)
++
++
++def _day(value: str) -> datetime:
++    return datetime.strptime(value, "%Y-%m-%d")
++
++
++async def run(since: datetime | None, until: datetime | None, dry_run: bool) -> None:
++    if not dry_run and not customer_connect.is_enabled():
++        sys.exit("Set CUSTOMER_CONNECT_URL and CUSTOMER_CONNECT_SECRET first.")
++    totals = {"orders": 0, "saved": 0, "added": 0, "storeChanged": 0, "notSaved": 0}
++    last_key: tuple[datetime, str] | None = None
++
++    async with AsyncSessionLocal() as db:
++        while True:
++            q = (select(Order, Brand.domain)
++                 .join(Brand, Brand.id == Order.brand_id, isouter=True)
++                 .where(Order.payment_status.in_(PAID))
++                 .order_by(Order.created_at, Order.id)
++                 .limit(customer_connect.BATCH_SIZE))
++            if since:
++                q = q.where(Order.created_at >= since)
++            if until:
++                q = q.where(Order.created_at < until + timedelta(days=1))
++            if last_key:
++                q = q.where((Order.created_at > last_key[0]) |
++                            ((Order.created_at == last_key[0]) & (Order.id > last_key[1])))
++            rows = (await db.execute(q)).all()
++            if not rows:
++                break
++            last_key = (rows[-1][0].created_at, rows[-1][0].id)
++            payloads = [customer_connect.order_payload(o, d) for o, d in rows]
++            totals["orders"] += len(payloads)
++            if dry_run:
++                print(f"would send {len(payloads)} orders, up to {last_key[1]} ({last_key[0]})")
++                continue
++            for attempt in range(5):
++                try:
++                    result = await customer_connect.send_orders(payloads)
++                    break
++                except Exception as exc:  # network blip or Customer Connect restarting
++                    if attempt == 4:
++                        raise
++                    wait = 5 * 2 ** attempt
++                    print(f"  send failed ({exc}); retrying in {wait}s")
++                    await asyncio.sleep(wait)
++            for k in ("saved", "added", "storeChanged", "notSaved"):
++                totals[k] += result.get(k, 0)
++            print(f"sent {len(payloads)} orders up to {last_key[1]}: {result.get('saved', 0)} saved, "
++                  f"{result.get('notSaved', 0)} not saved {result.get('dropped') or ''}")
++    print("done:", totals)
++
++
++def main() -> None:
++    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    p.add_argument("--all", action="store_true", help="every paid order")
++    p.add_argument("--since", type=_day, help="orders placed on or after YYYY-MM-DD")
++    p.add_argument("--until", type=_day, help="orders placed on or before YYYY-MM-DD")
++    p.add_argument("--dry-run", action="store_true", help="count, send nothing")
++    a = p.parse_args()
++    if not (a.all or a.since or a.until):
++        p.error("say which orders: --all, or --since/--until")
++    asyncio.run(run(a.since, a.until, a.dry_run))
++
++
++if __name__ == "__main__":
++    main()
