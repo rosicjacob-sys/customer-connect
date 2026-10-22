@@ -74,11 +74,29 @@ async function bootstrapAdmin() {
   console.log(`✅ Created admin ${email}`);
 }
 
+// A new database (e.g. Render creating it alongside the first deploy) can
+// refuse connections for a few minutes; wait for it rather than crash.
+const DB_NOT_READY = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'ECONNRESET', '57P03']);
+async function waitForDatabase({ tries = 36, delayMs = 5000 } = {}) {
+  for (let i = 1; ; i++) {
+    try {
+      await db.pool.query('SELECT 1');
+      return;
+    } catch (err) {
+      const notReady = DB_NOT_READY.has(err.code) || /timeout|terminated/i.test(err.message);
+      if (!notReady || i >= tries) throw err;
+      console.log(`⏳ Database not reachable yet (${err.code || err.message}); retrying in ${delayMs / 1000}s (${i}/${tries})`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+}
+
 async function main() {
   if (config.missing.length) {
     console.error(`❌ Missing settings: ${config.missing.join(', ')}. See .env.example.`);
     process.exit(1);
   }
+  await waitForDatabase();
   await db.migrate();
   await bootstrapAdmin();
   const app = createApp();
