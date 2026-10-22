@@ -10,7 +10,8 @@ const config = {
   port: Number(process.env.PORT || 3000),
   databaseUrl: process.env.DATABASE_URL,
   // Public address of this app. Unsubscribe links in every email point here.
-  appUrl: (process.env.APP_URL || `http://localhost:${process.env.PORT || 3000}`).replace(/\/+$/, ''),
+  // On Render it defaults to the service's own onrender.com address.
+  appUrl: (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`).replace(/\/+$/, ''),
 
   jwtSecret: process.env.JWT_SECRET || (isProd ? null : 'dev-only-secret-change-me'),
   // Signs unsubscribe links. Keep it stable: changing it breaks links in emails already sent.
@@ -27,8 +28,12 @@ const config = {
   sendDelayMs: Number(process.env.SEND_DELAY_MS || 550),
   workerPollMs: Number(process.env.WORKER_POLL_MS || 10000),
 
-  // Optional: the Chat Support Pro database, read only, to copy stores,
-  // customers and opt-outs across and to honour CSP opt-outs at send time.
+  // Optional link to Chat Support Pro, read only, to copy stores, customers
+  // and opt-outs across and to honour CSP opt-outs at send time. Its API
+  // (address + the key set there as CUSTOMER_CONNECT_API_KEY) is preferred;
+  // its database URL also works.
+  chatSupportApiUrl: (process.env.CHAT_SUPPORT_API_URL || '').trim().replace(/\/+$/, ''),
+  chatSupportApiKey: (process.env.CHAT_SUPPORT_API_KEY || '').trim(),
   chatSupportDatabaseUrl: process.env.CHAT_SUPPORT_DATABASE_URL || '',
   // How often new Chat Support Pro customers are pulled in automatically (0 = only by hand).
   chatSupportSyncMinutes: Number(process.env.CHAT_SUPPORT_SYNC_MINUTES ?? 15),
@@ -53,7 +58,7 @@ if (!config.databaseUrl) missing.push('DATABASE_URL');
 if (!config.jwtSecret) missing.push('JWT_SECRET');
 if (!config.unsubscribeSecret) missing.push('UNSUBSCRIBE_SECRET (or JWT_SECRET)');
 if (isProd && !config.resendApiKey && !config.dryRun) missing.push('RESEND_API_KEY (or EMAIL_DRY_RUN=true)');
-if (isProd && !process.env.APP_URL) missing.push('APP_URL');
+if (isProd && !process.env.APP_URL && !process.env.RENDER_EXTERNAL_URL) missing.push('APP_URL');
 config.missing = missing;
 
 module.exports = config;

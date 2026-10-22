@@ -34,8 +34,8 @@ Other commands:
 ## Go live
 
 1. **Resend**: verify each sending domain (Domains → Add), create an API key, and set `RESEND_API_KEY`. A store's sender address must be on a verified domain; stores without one use `DEFAULT_FROM_EMAIL`.
-2. **APP_URL**: the public https address. Unsubscribe links in every email point to `APP_URL/u`, so it must stay reachable.
-3. **Deploy** (Render, Railway, Fly…): one web service.
+2. **APP_URL**: the public https address. Unsubscribe links in every email point to `APP_URL/u`, so it must stay reachable. On Render it defaults to the service's onrender.com address.
+3. **Deploy**: see **Render** below. Elsewhere (Railway, Fly…): one web service.
    - Build: `npm ci --include=dev && npm run build`
    - Start: `npm start`
    - Health check: `/healthz`
@@ -93,9 +93,25 @@ Each paid order (`paid` or `manual`) sends its customer to Customer Connect with
 
 Requests are signed and expire after 5 minutes. Sending an order twice is harmless. Settings → Checkout portal shows when the last order arrived and how many weren't saved.
 
+### Render
+
+`render.yaml` sets up both: the web service (Starter plan) and its own Postgres 16 database (Basic 256 MB, 5 GB disk, reachable only from your Render services), in Oregon.
+
+1. Render dashboard → **Blueprints → New Blueprint Instance** → this repository.
+2. Fill in what it asks for: `RESEND_API_KEY`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `CHAT_SUPPORT_API_KEY` (below). Leave `APP_URL` blank until you add your own domain.
+3. `JWT_SECRET`, `UNSUBSCRIBE_SECRET` and `CHECKOUT_PORTAL_SECRET` are generated. Copy `CHECKOUT_PORTAL_SECRET` from the service's Environment page into the portal's `CUSTOMER_CONNECT_SECRET`.
+
+Tables are created on the first start.
+
 ## Link Chat Support Pro (optional)
 
-Set `CHAT_SUPPORT_DATABASE_URL` to Chat Support Pro's database. The connection is forced read-only; Customer Connect never changes Chat Support Pro. A dedicated read-only Postgres user is still best:
+**Through its API (recommended).** Chat Support Pro has a read-only API for Customer Connect at `/api/integrations/customer-connect`; it hands out customers already de-duplicated (one per email, at the store of their latest chat, with their newest name and phone). Customer Connect never sees Chat Support Pro's database password.
+
+1. Make a long random key: `openssl rand -hex 32`.
+2. Chat Support Pro: set `CUSTOMER_CONNECT_API_KEY` to it.
+3. Customer Connect: set `CHAT_SUPPORT_API_URL` to Chat Support Pro's address (`https://chat-support-pro.onrender.com`) and `CHAT_SUPPORT_API_KEY` to the same key.
+
+**Or through its database.** Set `CHAT_SUPPORT_DATABASE_URL` to Chat Support Pro's database instead. The connection is forced read-only; Customer Connect never changes Chat Support Pro. A dedicated read-only Postgres user is still best:
 
 ```sql
 CREATE ROLE cc_reader LOGIN PASSWORD '…';
@@ -108,7 +124,7 @@ Then:
 
 - Every `CHAT_SUPPORT_SYNC_MINUTES` (15 by default) it copies what changed: stores (name, domain, group, country, brand colour, sender), customers who chatted (dated by their **last chat**, so latest-store-wins works across chats and orders), customers from Chat Support Pro's uploads and manual adds (undated), unsubscribes, the active blacklist and the promo sent history. **Settings → Sync now** runs it straight away; **Full re-sync** reads everything again. Store access tokens are never read.
 - A blacklisting there blocks the person here for every store, including after they move to another store.
-- Before every batch, the recipients are also checked against Chat Support Pro's unsubscribes and blacklist. If that database can't be reached, the batch waits 5 minutes and tries again instead of risking an email to someone who opted out.
+- Before every batch, the recipients are also checked against Chat Support Pro's unsubscribes and blacklist. If Chat Support Pro can't be reached, the batch waits 5 minutes and tries again instead of risking an email to someone who opted out.
 - Stores that came from Chat Support Pro are overwritten by the next sync, so edit their details there.
 
 Unsubscribe links in emails sent earlier by Chat Support Pro still go to Chat Support Pro; the sync and the live check carry those opt-outs over.
