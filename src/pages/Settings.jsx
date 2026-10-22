@@ -62,13 +62,14 @@ function ChatSupportSync({ status, refreshStatus, refreshGroups }) {
       <div className="card-title">Chat Support Pro</div>
       {!cs?.configured ? (
         <div className="light">
-          Not linked. Set <span className="mono">CHAT_SUPPORT_DATABASE_URL</span> to Chat Support Pro's database (a read-only user is best) and restart.
-          Its stores, customers (with the time of their last chat), unsubscribes and blacklist are then copied here automatically.
+          Not linked. Make a long random key, set it as <span className="mono">CUSTOMER_CONNECT_API_KEY</span> on Chat Support Pro, and here
+          set <span className="mono">CHAT_SUPPORT_API_URL</span> to Chat Support Pro's address and <span className="mono">CHAT_SUPPORT_API_KEY</span> to the same key, then restart.
+          Its stores, customers (one per email, at the store of their last chat), unsubscribes and blacklist are then copied here automatically.
         </div>
       ) : (
         <div className="stack">
           <div className="light">
-            Linked, read only. {cs.syncMinutes > 0 ? `New and changed customers are copied every ${cs.syncMinutes} minutes` : 'Automatic sync is off (CHAT_SUPPORT_SYNC_MINUTES=0)'}, each linked to the store
+            Linked, read only{cs.via === 'database' ? ', through its database' : ', through its API'}. {cs.syncMinutes > 0 ? `New and changed customers are copied every ${cs.syncMinutes} minutes` : 'Automatic sync is off (CHAT_SUPPORT_SYNC_MINUTES=0)'}, each linked to the store
             of their latest chat. Unsubscribes and blacklisting there are also checked before every batch.
           </div>
           {last && (

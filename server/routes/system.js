@@ -27,6 +27,7 @@ router.get('/api/status', requireAuth, wrap(async (req, res) => {
     sendDelayMs: config.sendDelayMs,
     chatSupport: {
       configured: chatSupport.isConfigured(),
+      via: chatSupport.mode(),
       syncMinutes: config.chatSupportSyncMinutes,
       lastSync: await getSetting('chat_support_last_sync'),
     },
@@ -42,7 +43,7 @@ router.get('/api/status', requireAuth, wrap(async (req, res) => {
 router.get('/api/outbox', requireAuth, (req, res) => res.json({ dryRun: config.dryRun, messages: outbox }));
 
 router.post('/api/chat-support/sync', requireAuth, requireAdmin, wrap(async (req, res) => {
-  if (!chatSupport.isConfigured()) return res.status(400).json({ error: 'Set CHAT_SUPPORT_DATABASE_URL to link Chat Support Pro' });
+  if (!chatSupport.isConfigured()) return res.status(400).json({ error: 'Set CHAT_SUPPORT_API_URL and CHAT_SUPPORT_API_KEY to link Chat Support Pro' });
   try {
     const result = await jobs.syncChatSupport({ full: req.body?.full === true });
     if (!result) return res.status(409).json({ error: 'A sync is already running. Try again in a minute.' });

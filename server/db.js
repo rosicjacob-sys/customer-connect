@@ -5,7 +5,10 @@
 const { Pool } = require('pg');
 const config = require('./config');
 
-const local = /localhost|127\.0\.0\.1|\.internal|host=\/|@\/|\?host=/.test(config.databaseUrl || '');
+// No SSL on local or private-network addresses. Render's internal database
+// address (what render.yaml passes in) has a host without dots: dpg-…-a.
+const dbHost = (() => { try { return new URL(config.databaseUrl).hostname; } catch { return ''; } })();
+const local = /localhost|127\.0\.0\.1|\.internal|host=\/|@\/|\?host=/.test(config.databaseUrl || '') || (!!dbHost && !dbHost.includes('.'));
 const pool = new Pool({
   connectionString: config.databaseUrl,
   ssl: local || process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false },
