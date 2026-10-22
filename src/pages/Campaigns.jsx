@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import api from '../lib/api';
-import { fmtWhen, fmtSpan, fmtInterval, n, TIMEZONES } from '../lib/util';
+import { fmtWhen, fmtSpan, fmtInterval, n, plural, TIMEZONES } from '../lib/util';
 import { Empty, Loading, Modal, PaceHint, StatusBadge, useConfirm, useToast } from '../components/ui';
 import { PreviewModal } from '../components/email';
+import { RowCheckbox, SelectionBar, ViewCheckbox, useSelection } from '../components/selection';
 
 const TERMINAL = ['completed', 'cancelled'];
 const SKIP_REASONS = {
@@ -165,6 +166,8 @@ export default function Campaigns({ storeGroup, navigate }) {
   const [busyId, setBusyId] = useState(null);
   const [editing, setEditing] = useState(null);
   const [detailId, setDetailId] = useState(null);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const sel = useSelection(storeGroup);
 
   const load = useCallback(async () => {
     try { setCampaigns(await api.campaigns(storeGroup)); } catch (err) { toast(err.message, { bad: true }); setCampaigns((c) => c || []); }
@@ -196,6 +199,26 @@ export default function Campaigns({ storeGroup, navigate }) {
     }
   };
 
+  const ids = (campaigns || []).map((c) => c.id);
+  const picked = (campaigns || []).filter((c) => sel.isChecked(c.id));
+  const which = plural(picked.length, 'campaign');
+  const VERB = { pause: 'Paused', resume: 'Resumed', cancel: 'Stopped', delete: 'Deleted' };
+  const batch = async (action, ask) => {
+    if (ask && !(await confirm(ask))) return;
+    setBatchBusy(true);
+    try {
+      const r = await api.campaignsBatch(picked.map((c) => c.id), action);
+      toast(`${VERB[action]} ${plural(r.changed, 'campaign')}${r.skipped.length ? `; ${n(r.skipped.length)} left as they were (${r.skipped[0].reason})` : ''}`,
+        { bad: !r.changed && r.skipped.length > 0 });
+      sel.clear();
+      await load();
+    } catch (err) {
+      toast(err.message, { bad: true });
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   return (
     <main className="page">
       {confirmDialog}
@@ -212,6 +235,7 @@ export default function Campaigns({ storeGroup, navigate }) {
         </Empty>
       ) : (
         <div className="list">
+          <label className="row light" style={{ gap: 8, fontSize: 12.5 }}><ViewCheckbox sel={sel} ids={ids} label="Select all campaigns" /> Select all</label>
           {campaigns.map((c) => {
             const done = c.sentCount + c.failedCount + c.skippedCount;
             const pct = c.totalRecipients ? Math.round((done / c.totalRecipients) * 100) : 0;
@@ -219,6 +243,7 @@ export default function Campaigns({ storeGroup, navigate }) {
             return (
               <div key={c.id} className="card">
                 <div className="row" style={{ alignItems: 'flex-start' }}>
+                  <span className="card-check"><RowCheckbox sel={sel} id={c.id} label={`Select ${c.name}`} /></span>
                   <div className="grow" style={{ minWidth: 0 }}>
                     <div className="row" style={{ gap: 8 }}>
                       <button type="button" className="btn-ghost" style={{ border: 0, background: 'none', padding: 0, cursor: 'pointer', fontWeight: 700, fontSize: 15, color: 'var(--text)' }}
@@ -250,6 +275,14 @@ export default function Campaigns({ storeGroup, navigate }) {
               </div>
             );
           })}
+          <SelectionBar sel={sel} total={ids.length} viewIds={ids} noun={['campaign', 'campaigns']}>
+            <button type="button" className="btn btn-sm" disabled={batchBusy} onClick={() => batch('pause')}>Pause</button>
+            <button type="button" className="btn btn-sm" disabled={batchBusy} onClick={() => batch('resume')}>Resume</button>
+            <button type="button" className="btn btn-sm" disabled={batchBusy}
+              onClick={() => batch('cancel', { title: `Stop ${which}?`, message: "Nobody else gets them. You can't restart a stopped campaign, only delete it.", confirmLabel: 'Stop', danger: true })}>Stop</button>
+            <button type="button" className="btn btn-sm btn-danger" disabled={batchBusy}
+              onClick={() => batch('delete', { title: `Delete ${which}?`, message: "Only finished or stopped ones are deleted; the rest are left. Their history goes too. This can't be undone.", confirmLabel: 'Delete', danger: true })}>Delete</button>
+          </SelectionBar>
         </div>
       )}
     </main>

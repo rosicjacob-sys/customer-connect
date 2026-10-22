@@ -221,6 +221,15 @@ const SCHEMA = [
      CONSTRAINT blocklist_email_store_unique UNIQUE NULLS NOT DISTINCT (email, store_domain)
    )`,
 
+  // "Customers from this domain belong to that store": set when a store
+  // that isn't set up is assigned to an existing one, or two stores merge.
+  `CREATE TABLE IF NOT EXISTS store_aliases (
+     domain     TEXT PRIMARY KEY,
+     store_id   INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+     created_by TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+   )`,
+  'CREATE INDEX IF NOT EXISTS store_aliases_store_idx ON store_aliases (store_id)',
   `CREATE TABLE IF NOT EXISTS app_settings (
      key        TEXT PRIMARY KEY,
      value      JSONB,

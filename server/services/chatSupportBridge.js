@@ -238,9 +238,12 @@ async function optOutsFor(emails) {
 async function saveStores(rows) {
   let added = 0, updated = 0;
   const conflicts = [];
+  // Stores merged into another here stay merged: their domain is a rule now.
+  const { rows: aliasRows } = await db.pool.query('SELECT domain FROM store_aliases');
+  const merged = new Set(aliasRows.map((r) => r.domain));
   for (const s of rows) {
     const domain = cleanDomain(s.shop_domain);
-    if (!domain) continue;
+    if (!domain || merged.has(domain.replace(/^www\./, ''))) continue;
     const values = [
       s.id, domain, s.brand_name || domain, s.store_group || null, s.store_group_name || s.store_group || null,
       s.country || null, s.brand_color || null, s.from_email || null, s.from_name || null, s.is_active !== false,

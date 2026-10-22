@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import api from '../lib/api';
 import { n, plural, fmtWhen, fmtDay, downloadBlob, EMAIL_RE } from '../lib/util';
 import { Empty, Loading, Modal, SOURCE_OPTIONS, SourceBadges, useConfirm, useToast } from '../components/ui';
+import { ChoiceModal, RowCheckbox, SelectionBar, ViewCheckbox, useSelection } from '../components/selection';
 
 const PAGE_SIZE = 50;
 const SOURCE_NAME = { checkout: 'order', chat: 'chat', upload: 'upload', manual: 'added by hand' };
@@ -225,10 +226,16 @@ function CustomerList({ storeGroup, groups }) {
   const [editing, setEditing] = useState(null); // null | 'new' | customer
   const [history, setHistory] = useState(null);
   const [importing, setImporting] = useState(false);
+  const [allStores, setAllStores] = useState([]);
+  const [moving, setMoving] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
   const debounce = useRef(null);
 
   useEffect(() => { api.stores(storeGroup).then(setStores).catch(() => {}); }, [storeGroup]);
+  // Moving can go to any store, in any group.
+  useEffect(() => { api.stores().then(setAllStores).catch(() => {}); }, []);
   const filters = useMemo(() => ({ storeGroup, search: query, sources, country, status }), [storeGroup, query, sources, country, status]);
+  const sel = useSelection(JSON.stringify(filters));
   const load = useCallback(async (p = 0) => {
     try {
       setData(await api.customers({ ...filters, limit: PAGE_SIZE, offset: p * PAGE_SIZE }));
@@ -261,6 +268,37 @@ function CustomerList({ storeGroup, groups }) {
     } catch (err) { toast(err.message, { bad: true }); }
   };
 
+  const picked = data ? sel.count(data.total) : 0;
+  const who = plural(picked, 'customer');
+  const batch = async (action, ask, extra = {}) => {
+    if (ask && !(await confirm(ask))) return;
+    setBatchBusy(true);
+    try {
+      const r = await api.customersBatch(action, sel.payload(filters), extra);
+      const already = r.selected - r.changed;
+      const msg = {
+        archive: `Archived ${plural(r.changed, 'customer')}: left out of campaigns`,
+        restore: `Restored ${plural(r.changed, 'customer')}`,
+        unsubscribe: `Unsubscribed ${plural(r.changed, 'customer')}${already ? ` (${n(already)} already were)` : ''}`,
+        block: `Blocked ${plural(r.changed, 'customer')}${already ? ` (${n(already)} already were)` : ''}`,
+        delete: `Deleted ${plural(r.changed, 'customer')}`,
+        move: `Moved ${plural(r.changed, 'customer')}${r.notMoved?.length ? `; ${n(r.notMoved.length)} couldn't be (${r.notMoved[0].reason})` : ''}`,
+      }[action];
+      toast(msg);
+      sel.clear();
+      load(action === 'delete' ? 0 : page);
+    } catch (err) {
+      toast(err.message, { bad: true });
+      throw err;
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+  const exportSelected = async () => {
+    try { downloadBlob(await api.exportSelected(sel.payload(filters)), `customers-selected-${new Date().toISOString().slice(0, 10)}.csv`); }
+    catch (err) { toast(err.message, { bad: true }); }
+  };
+
   const exportCsv = async () => {
     try { downloadBlob(await api.exportCustomers(filters), `customers-${new Date().toISOString().slice(0, 10)}.csv`); }
     catch (err) { toast(err.message, { bad: true }); }
@@ -272,6 +310,13 @@ function CustomerList({ storeGroup, groups }) {
       {confirmDialog}
       {importing && <ImportModal groups={groups} onClose={() => setImporting(false)} onImported={() => load(0)} />}
       {history && <HistoryModal customer={history} onClose={() => setHistory(null)} />}
+      {moving && (
+        <ChoiceModal title={`Move ${who}`} label="To store" confirmLabel="Move"
+          options={allStores.map((s) => ({ value: String(s.id), label: `${s.brandName} (${s.domain})${s.storeGroupName ? ` · ${s.storeGroupName}` : ''}` }))}
+          message="It counts as their latest store now: they're emailed as that store. Their old store stays in their history, and a later order or chat elsewhere moves them again."
+          onClose={() => setMoving(false)}
+          onConfirm={async (p) => { await batch('move', null, { storeId: Number(p.value) }); setMoving(false); }} />
+      )}
       {editing && <CustomerModal customer={editing === 'new' ? null : editing} stores={stores} onClose={() => setEditing(null)}
         onSaved={(c) => { setEditing(null); toast(c?.existed ? `${c.email} was already a customer: moved to this store` : 'Saved'); load(page); }} />}
       <div className="row" style={{ marginBottom: 12 }}>
@@ -303,10 +348,14 @@ function CustomerList({ storeGroup, groups }) {
         <>
           <div className="table-wrap">
             <table className="table">
-              <thead><tr><th>Customer</th><th>Store</th><th className="hide-sm">Last order or chat</th><th /></tr></thead>
+              <thead><tr>
+                <th className="check-cell"><ViewCheckbox sel={sel} ids={data.rows.map((c) => c.id)} label="Select all on this page" /></th>
+                <th>Customer</th><th>Store</th><th className="hide-sm">Last order or chat</th><th />
+              </tr></thead>
               <tbody>
                 {data.rows.map((c) => (
                   <tr key={c.id} style={c.status ? { opacity: 0.6 } : undefined}>
+                    <td className="check-cell"><RowCheckbox sel={sel} id={c.id} label={`Select ${c.email}`} /></td>
                     <td style={{ minWidth: 220 }}>
                       <div className="row" style={{ gap: 6 }}><strong>{c.email}</strong><SourceBadges customer={c} />{c.status && <span className="badge">archived</span>}
                         {c.opted_out && <span className="badge badge-cancelled" title="Never emailed: see Do not email">{c.opted_out}</span>}</div>
@@ -334,6 +383,20 @@ function CustomerList({ storeGroup, groups }) {
               </tbody>
             </table>
           </div>
+          <SelectionBar sel={sel} total={data.total} viewIds={data.rows.map((c) => c.id)} noun={['customer', 'customers']}>
+            <button type="button" className="btn btn-sm" disabled={batchBusy} onClick={() => setMoving(true)}>Move to store…</button>
+            {status !== 'archived' && <button type="button" className="btn btn-sm" disabled={batchBusy}
+              onClick={() => batch('archive', { title: `Archive ${who}?`, message: "They're left out of campaigns until you restore them.", confirmLabel: 'Archive' }).catch(() => {})}>Archive</button>}
+            {status !== 'active' && <button type="button" className="btn btn-sm" disabled={batchBusy}
+              onClick={() => batch('restore').catch(() => {})}>Restore</button>}
+            <button type="button" className="btn btn-sm" disabled={batchBusy}
+              onClick={() => batch('unsubscribe', { title: `Unsubscribe ${who}?`, message: 'They get no more campaigns from any store. You can undo this under Do not email.', confirmLabel: 'Unsubscribe' }).catch(() => {})}>Unsubscribe</button>
+            <button type="button" className="btn btn-sm" disabled={batchBusy}
+              onClick={() => batch('block', { title: `Block ${who}?`, message: 'Never emailed by any store, even if they move. You can undo this under Do not email.', confirmLabel: 'Block' }).catch(() => {})}>Block</button>
+            <button type="button" className="btn btn-sm" disabled={batchBusy} onClick={exportSelected}>Export CSV</button>
+            <button type="button" className="btn btn-sm btn-danger" disabled={batchBusy}
+              onClick={() => batch('delete', { title: `Delete ${who}?`, message: "They and their store history are removed. If they order or chat again, they're added back as a new customer with only the new details. To make sure someone is never emailed, block or unsubscribe them instead.", confirmLabel: `Delete ${who}`, danger: true }).catch(() => {})}>Delete</button>
+          </SelectionBar>
           {pages > 1 && (
             <div className="pager">
               <button type="button" className="btn btn-sm" disabled={page <= 0} onClick={() => load(page - 1)}>← Prev</button>
@@ -415,6 +478,8 @@ function DoNotEmail() {
   const [kind, setKind] = useState('unsubscribe');
   const [storeDomain, setStoreDomain] = useState('');
   const [reason, setReason] = useState('');
+  const [confirm, confirmDialog] = useConfirm();
+  const sel = useSelection(search);
   const load = useCallback(() => api.optOuts(search.trim() || undefined).then(setData).catch((e) => toast(e.message, { bad: true })), [search, toast]);
   useEffect(() => { const t = setTimeout(load, 250); return () => clearTimeout(t); }, [load]);
 
@@ -431,9 +496,24 @@ function DoNotEmail() {
   const remove = async (fn, label) => {
     try { await fn(); toast(`${label} removed`); load(); } catch (err) { toast(err.message, { bad: true }); }
   };
+  // One selection over both lists: keys "u:<id>" and "b:<id>".
+  const keys = data ? [...data.unsubscribes.map((u) => `u:${u.id}`), ...data.blocks.map((b) => `b:${b.id}`)] : [];
+  const removeSelected = async () => {
+    const picked = sel.ids();
+    if (!(await confirm({ title: `Remove ${plural(picked.length, 'person', 'people')} from Do not email?`,
+      message: 'Only if they asked to be emailed again: they can get campaigns from then on.', confirmLabel: 'Remove', danger: true }))) return;
+    const ids = (p) => picked.filter((k) => k.startsWith(p)).map((k) => Number(k.slice(2)));
+    try {
+      const r = await api.removeOptOuts(ids('u:'), ids('b:'));
+      toast(`Removed ${n(r.changed)}`);
+      sel.clear();
+      load();
+    } catch (err) { toast(err.message, { bad: true }); }
+  };
 
   return (
     <div className="stack">
+      {confirmDialog}
       <div className="page-sub" style={{ margin: 0 }}>
         Checked before every batch: these people are never emailed by any store, even if they're in a campaign that's already running or move to another store.
         People who bounced or complained before are also skipped automatically (Resend's suppression list).
@@ -454,11 +534,14 @@ function DoNotEmail() {
       {!data ? <Loading /> : (
         <div className="row" style={{ alignItems: 'flex-start' }}>
           <div className="grow" style={{ minWidth: 280 }}>
-            <div className="card-title">Unsubscribed ({n(data.unsubscribes.length)})</div>
+            <div className="card-title row" style={{ gap: 8 }}>
+              <ViewCheckbox sel={sel} ids={data.unsubscribes.map((u) => `u:${u.id}`)} label="Select all unsubscribed" />Unsubscribed ({n(data.unsubscribes.length)})
+            </div>
             <div className="table-wrap"><table className="table"><tbody>
               {data.unsubscribes.length === 0 && <tr><td className="muted">Nobody.</td></tr>}
               {data.unsubscribes.map((u) => (
                 <tr key={u.id}>
+                  <td className="check-cell"><RowCheckbox sel={sel} id={`u:${u.id}`} label={`Select ${u.email}`} /></td>
                   <td><strong>{u.email}</strong><div className="hint">{SOURCE_LABEL[u.source] || u.source} · {fmtWhen(u.created_at)}</div></td>
                   <td style={{ textAlign: 'right' }}><button type="button" className="btn btn-sm" title="Only if they asked to be emailed again"
                     onClick={() => remove(() => api.removeUnsubscribe(u.id), u.email)}>Remove</button></td>
@@ -467,11 +550,14 @@ function DoNotEmail() {
             </tbody></table></div>
           </div>
           <div className="grow" style={{ minWidth: 280 }}>
-            <div className="card-title">Blocked ({n(data.blocks.length)})</div>
+            <div className="card-title row" style={{ gap: 8 }}>
+              <ViewCheckbox sel={sel} ids={data.blocks.map((b) => `b:${b.id}`)} label="Select all blocked" />Blocked ({n(data.blocks.length)})
+            </div>
             <div className="table-wrap"><table className="table"><tbody>
               {data.blocks.length === 0 && <tr><td className="muted">Nobody.</td></tr>}
               {data.blocks.map((b) => (
                 <tr key={b.id}>
+                  <td className="check-cell"><RowCheckbox sel={sel} id={`b:${b.id}`} label={`Select ${b.email}`} /></td>
                   <td><strong>{b.email}</strong><div className="hint">{b.store_domain ? `blocked at ${b.store_domain}, applies everywhere` : 'every store'}{b.reason ? ` · ${b.reason}` : ''}</div></td>
                   <td style={{ textAlign: 'right' }}><button type="button" className="btn btn-sm" onClick={() => remove(() => api.removeBlock(b.id), b.email)}>Remove</button></td>
                 </tr>
@@ -480,6 +566,9 @@ function DoNotEmail() {
           </div>
         </div>
       )}
+      <SelectionBar sel={sel} total={keys.length} viewIds={keys} noun={['person', 'people']}>
+        <button type="button" className="btn btn-sm btn-danger" onClick={removeSelected}>Remove from Do not email</button>
+      </SelectionBar>
     </div>
   );
 }

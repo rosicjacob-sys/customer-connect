@@ -8,9 +8,12 @@
 //   GET    /api/customers/import/template  the CSV format to follow
 //   GET    /api/customers/:id/history      every store this customer was linked to
 //   GET    /api/customers/export           the filtered list as CSV
+//   POST   /api/customers/batch            one action on many: move, archive, restore, block, unsubscribe, delete
+//   POST   /api/customers/export           the selected customers as CSV
 //   GET    /api/audience                   everyone a campaign could go to
 //   GET    /api/sent   POST /api/sent/reset           sent ledger
 //   GET    /api/opt-outs, POST/DELETE …/unsubscribes, …/blocks   do-not-email list
+//   POST   /api/opt-outs/batch             remove several at once
 
 const express = require('express');
 const multer = require('multer');
@@ -50,8 +53,7 @@ const csvCell = (v) => {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-router.get('/customers/export', wrap(async (req, res) => {
-  const { rows } = await customers.listCustomers({ ...listFilters(req.query), limit: 500000, offset: 0 });
+function sendCsv(res, rows) {
   const header = ['customer_name', 'email', 'store_name', 'store_url', 'phone', 'last_order_date', 'country', 'sources', 'status'];
   const lines = [header.join(',')].concat(rows.map((r) => [
     r.name, r.email, r.store_name, r.store_domain, r.phone,
@@ -62,6 +64,37 @@ router.get('/customers/export', wrap(async (req, res) => {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="customers-${new Date().toISOString().slice(0, 10)}.csv"`);
   res.send(lines.join('\n'));
+}
+
+router.get('/customers/export', wrap(async (req, res) => {
+  const { rows } = await customers.listCustomers({ ...listFilters(req.query), limit: 500000, offset: 0 });
+  sendCsv(res, rows);
+}));
+
+// { ids } or { all: true, filters, exceptIds }: what the list's checkboxes picked.
+function readSelection(body) {
+  const sel = body?.selection || {};
+  return {
+    ids: intList(sel.ids) || [],
+    all: sel.all === true,
+    filters: listFilters(sel.filters || {}),
+    exceptIds: intList(sel.exceptIds) || [],
+  };
+}
+
+router.post('/customers/export', wrap(async (req, res) => {
+  const ids = await customers.resolveSelection(readSelection(req.body));
+  if (!ids.length) throw httpError(400, 'Pick the customers to export');
+  sendCsv(res, await customers.customersByIds(ids));
+}));
+
+router.post('/customers/batch', wrap(async (req, res) => {
+  const action = String(req.body?.action || '');
+  const ids = await customers.resolveSelection(readSelection(req.body));
+  if (!ids.length) throw httpError(400, 'Pick at least one customer');
+  const result = await customers.batchCustomers(action, ids, { storeId: parseInt(req.body?.storeId, 10), user: req.user.email });
+  console.log(`[customers] ${req.user.email}: ${action} on ${ids.length} selected, ${result.changed} changed`);
+  res.json({ selected: ids.length, ...result });
 }));
 
 router.get('/customers/import/template', (req, res) => {
@@ -195,6 +228,15 @@ router.post('/opt-outs/blocks', wrap(async (req, res) => {
     ON CONFLICT ON CONSTRAINT blocklist_email_store_unique DO UPDATE SET reason = EXCLUDED.reason`,
   [email, storeDomain, str(req.body?.reason) || null, req.user.email]);
   res.status(201).json({ ok: true });
+}));
+
+router.post('/opt-outs/batch', wrap(async (req, res) => {
+  if (req.body?.action !== 'remove') throw httpError(400, 'Unknown action');
+  const unsubscribeIds = intList(req.body?.unsubscribeIds) || [];
+  const blockIds = intList(req.body?.blockIds) || [];
+  const a = unsubscribeIds.length ? (await pool.query('DELETE FROM unsubscribes WHERE id = ANY($1)', [unsubscribeIds])).rowCount : 0;
+  const b = blockIds.length ? (await pool.query('DELETE FROM blocklist WHERE id = ANY($1)', [blockIds])).rowCount : 0;
+  res.json({ changed: a + b });
 }));
 
 router.delete('/opt-outs/blocks/:id', wrap(async (req, res) => {

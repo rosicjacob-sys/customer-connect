@@ -63,6 +63,9 @@ const api = {
   deleteStore: (id) => del(`/api/stores/${id}`),
   addStores: (stores, shared = {}) => post('/api/stores/bulk', { stores, ...shared }),
   waitingStores: () => get('/api/stores/waiting'),
+  assignStores: (domains, storeId) => post('/api/stores/assign', { domains, storeId }),
+  removeStoreRule: (domain) => del(`/api/stores/aliases/${encodeURIComponent(domain)}`),
+  storesBatch: (ids, action, extra = {}) => post('/api/stores/batch', { ids, action, ...extra }),
   segments: (storeGroup) => get('/api/segments', { storeGroup }),
   saveSegment: (s) => put('/api/segments', s),
   deleteSegment: (id) => del(`/api/segments/${id}`),
@@ -80,6 +83,8 @@ const api = {
     form.append('file', file);
     return request('POST', `/api/customers/import${apply ? '?apply=1' : ''}`, null, { form });
   },
+  customersBatch: (action, selection, extra = {}) => post('/api/customers/batch', { action, selection, ...extra }),
+  exportSelected: async (selection) => (await request('POST', '/api/customers/export', { selection }, { raw: true })).blob(),
   exportCustomers: async (params) => {
     const res = await request('GET', `/api/customers/export${query(params)}`, null, { raw: true });
     return res.blob();
@@ -92,12 +97,14 @@ const api = {
   removeUnsubscribe: (id) => del(`/api/opt-outs/unsubscribes/${id}`),
   addBlock: (b) => post('/api/opt-outs/blocks', b),
   removeBlock: (id) => del(`/api/opt-outs/blocks/${id}`),
+  removeOptOuts: (unsubscribeIds, blockIds) => post('/api/opt-outs/batch', { action: 'remove', unsubscribeIds, blockIds }),
 
   templates: (storeGroup) => get('/api/templates', { storeGroup }),
   template: (id) => get(`/api/templates/${id}`),
   createTemplate: (t) => post('/api/templates', t),
   updateTemplate: (id, t) => put(`/api/templates/${id}`, t),
   deleteTemplate: (id) => del(`/api/templates/${id}`),
+  deleteTemplates: (ids) => post('/api/templates/batch', { action: 'delete', ids }),
   testSend: (payload) => post('/api/test-send', payload),
 
   campaigns: (storeGroup) => get('/api/campaigns', { storeGroup }),
@@ -106,6 +113,7 @@ const api = {
   updateCampaign: (id, changes) => patch(`/api/campaigns/${id}`, changes),
   campaignAction: (id, action) => post(`/api/campaigns/${id}/${action}`),
   deleteCampaign: (id) => del(`/api/campaigns/${id}`),
+  campaignsBatch: (ids, action) => post('/api/campaigns/batch', { ids, action }),
 };
 
 export default api;

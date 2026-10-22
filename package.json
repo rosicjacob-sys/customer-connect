@@ -14,7 +14,7 @@
     "build": "vite build",
     "start": "node server/index.js",
     "create-admin": "node server/scripts/create-admin.js",
-    "test": "node --test test/clean.test.js test/merge.test.js test/schedule.test.js && node --test test/ingest.test.js && node --test test/chatSupportApi.test.js && node --test test/e2e.test.js"
+    "test": "node --test test/clean.test.js test/merge.test.js test/schedule.test.js && node --test test/ingest.test.js && node --test test/chatSupportApi.test.js && node --test test/batch.test.js && node --test test/e2e.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

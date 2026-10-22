@@ -80,7 +80,18 @@ Jane Doe,jane.doe@gmail.com,Ottawa Peptides,https://ottawapeptides.com,613-555-0
 
 `email` and `store_url` are required. Common header spellings ("Email Address", "Store URL", "Phone Number") also work. Checking a file saves nothing. Stores the file names that aren't set up are listed with an **Add these stores** button; their rows import once the stores exist. Rows not saved can be downloaded as a CSV.
 
-Customers that arrive from the portal or Chat Support Pro for a store that isn't set up are kept, and listed on the Stores page ("waiting for a store") until it's added.
+Customers that arrive from the portal or Chat Support Pro for a store that isn't set up are kept, and listed on the Stores page ("waiting for a store"). From there, either add them as new stores or **assign them to an existing store**: their customers move there (keeping their real order dates), and the domain becomes a rule, so later orders and chats from it go to that store too. The store's edit window lists its rules; removing one leaves customers already moved where they are.
+
+**Batch actions.** Every list has checkboxes, a header box for the page, **Select all N matching** (every page that fits the filters), and **Deselect all**:
+
+| List | Actions |
+|---|---|
+| Customers | move to a store, archive, restore, unsubscribe, block, export CSV, delete |
+| Stores | add to or remove from a segment, set group, set country, activate, deactivate, merge into another store, delete |
+| Campaigns | pause, resume, stop, delete |
+| Templates, Do not email | delete / remove |
+
+Deleting a customer removes them and their store history; if they order or chat again they come back as a new customer with only the new details. Merging stores moves their customers to the store kept and turns their domains into rules. Group, country and active changes to stores copied from Chat Support Pro are set back by its next sync (change those there); merges stick.
 
 ## Link the checkout portal
 
