@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import api from '../lib/api';
-import { fmtWhen } from '../lib/util';
+import { fmtWhen, plural } from '../lib/util';
 import { Empty, Loading, Modal, useConfirm, useToast } from '../components/ui';
 import { PreviewModal, SendTestPanel, TokenReference, UnsubscribeWarning, downloadTemplateHtml } from '../components/email';
+import { RowCheckbox, SelectionBar, ViewCheckbox, useSelection } from '../components/selection';
 
 const STARTER_HTML = `<!DOCTYPE html>
 <html>
@@ -82,6 +83,7 @@ export default function Templates({ storeGroup, storeGroupName }) {
   const [stores, setStores] = useState([]);
   const [editing, setEditing] = useState(null); // null | 'new' | template
   const [preview, setPreview] = useState(null);
+  const sel = useSelection(storeGroup);
 
   const load = useCallback(() => api.templates(storeGroup).then(setTemplates).catch((e) => { toast(e.message, { bad: true }); setTemplates([]); }), [storeGroup, toast]);
   useEffect(() => { load(); }, [load]);
@@ -93,6 +95,18 @@ export default function Templates({ storeGroup, storeGroupName }) {
   const remove = async (t) => {
     if (!(await confirm({ title: `Delete "${t.name}"?`, message: 'Campaigns already made from it keep their own copy and are not affected.', confirmLabel: 'Delete', danger: true }))) return;
     try { await api.deleteTemplate(t.id); toast(`"${t.name}" deleted`); load(); } catch (err) { toast(err.message, { bad: true }); }
+  };
+
+  const ids = (templates || []).map((t) => t.id);
+  const removeSelected = async () => {
+    const picked = (templates || []).filter((t) => sel.isChecked(t.id));
+    if (!(await confirm({ title: `Delete ${plural(picked.length, 'template')}?`, message: 'Campaigns already made from them keep their own copy and are not affected.', confirmLabel: 'Delete', danger: true }))) return;
+    try {
+      const r = await api.deleteTemplates(picked.map((t) => t.id));
+      toast(`Deleted ${plural(r.changed, 'template')}`);
+      sel.clear();
+      load();
+    } catch (err) { toast(err.message, { bad: true }); }
   };
 
   return (
@@ -116,8 +130,10 @@ export default function Templates({ storeGroup, storeGroupName }) {
         </Empty>
       ) : (
         <div className="list">
+          <label className="row light" style={{ gap: 8, fontSize: 12.5 }}><ViewCheckbox sel={sel} ids={ids} label="Select all templates" /> Select all</label>
           {templates.map((t) => (
-            <div key={t.id} className="card row">
+            <div key={t.id} className="card row" style={{ alignItems: 'flex-start' }}>
+              <span className="card-check"><RowCheckbox sel={sel} id={t.id} label={`Select ${t.name}`} /></span>
               <div className="grow" style={{ minWidth: 0 }}>
                 <div style={{ fontWeight: 700 }}>{t.name} {!t.store_group && storeGroup && <span className="badge">all groups</span>}</div>
                 <div className="light ellipsis" style={{ fontSize: 12.5 }}>{t.subject}</div>
@@ -131,6 +147,9 @@ export default function Templates({ storeGroup, storeGroupName }) {
               </div>
             </div>
           ))}
+          <SelectionBar sel={sel} total={ids.length} viewIds={ids} noun={['template', 'templates']}>
+            <button type="button" className="btn btn-sm btn-danger" onClick={removeSelected}>Delete</button>
+          </SelectionBar>
         </div>
       )}
     </main>

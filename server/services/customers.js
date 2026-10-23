@@ -170,6 +170,81 @@ async function deleteCustomer(id) {
   return true;
 }
 
+// ── Batch actions ───────────────────────────────────────────────────────────
+
+const BATCH_MAX = 200000;
+
+// The customers a batch action applies to: the ids picked, or everyone
+// matching the list's filters (all pages), minus any unticked.
+async function resolveSelection({ ids, all, filters: f = {}, exceptIds = [] }) {
+  if (!all) return [...new Set((ids || []).map(Number).filter(Number.isFinite))].slice(0, BATCH_MAX);
+  const { params, where } = filters(f);
+  if (f.country) { params.push(f.country); where.push(`s.country = $${params.length}`); }
+  if (exceptIds.length) { params.push(exceptIds); where.push(`NOT (cu.id = ANY($${params.length}))`); }
+  const { rows } = await pool.query(
+    `SELECT cu.id FROM customers cu LEFT JOIN stores s ON s.id = cu.store_id
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''} LIMIT ${BATCH_MAX}`, params);
+  return rows.map((r) => r.id);
+}
+
+// → { changed } (and for move: notMoved, with reasons)
+async function batchCustomers(action, ids, { storeId, user } = {}) {
+  if (!ids.length) return { changed: 0 };
+  if (action === 'archive' || action === 'restore') {
+    const { rowCount } = await pool.query(
+      `UPDATE customers SET status = $2, updated_at = NOW() WHERE id = ANY($1) AND status IS DISTINCT FROM $2`,
+      [ids, action === 'archive' ? 'archived' : null]);
+    return { changed: rowCount };
+  }
+  if (action === 'block') {
+    // A block applies to every store, also after they move.
+    const { rowCount } = await pool.query(`
+      INSERT INTO blocklist (email, store_domain, reason, created_by)
+      SELECT email, NULL, 'Blocked from the Customers page', $2 FROM customers WHERE id = ANY($1)
+      ON CONFLICT ON CONSTRAINT blocklist_email_store_unique DO NOTHING`, [ids, user]);
+    return { changed: rowCount };
+  }
+  if (action === 'unsubscribe') {
+    const { rowCount } = await pool.query(`
+      INSERT INTO unsubscribes (email, source) SELECT email, 'manual' FROM customers WHERE id = ANY($1)
+      ON CONFLICT (email) DO NOTHING`, [ids]);
+    return { changed: rowCount };
+  }
+  if (action === 'delete') {
+    // Gone completely, history too: if they order or chat again they come
+    // back as a new customer with only the new details.
+    return transaction(async (client) => {
+      const { rows } = await client.query('DELETE FROM customers WHERE id = ANY($1) RETURNING email', [ids]);
+      await client.query('DELETE FROM customer_stores WHERE email = ANY($1)', [rows.map((r) => r.email)]);
+      return { changed: rows.length };
+    });
+  }
+  if (action === 'move') {
+    // Same as changing the store in a customer's edit window: it counts as
+    // seeing them at that store now.
+    const { rows: [store] } = await pool.query('SELECT domain, brand_name FROM stores WHERE id = $1', [storeId]);
+    if (!store) throw httpError(400, 'Pick the store to move them to');
+    const { rows } = await pool.query('SELECT email FROM customers WHERE id = ANY($1) AND store_id IS DISTINCT FROM $2', [ids, storeId]);
+    let changed = 0;
+    const notMoved = [];
+    for (let i = 0; i < rows.length; i += 5000) {
+      const report = await ingest(rows.slice(i, i + 5000).map((r) => ({ email: r.email, storeUrl: store.domain, storeName: store.brand_name, seenAt: new Date() })),
+        { source: 'manual', createdBy: user });
+      changed += report.saved;
+      notMoved.push(...report.rejected.map((r) => ({ email: r.email, reason: r.reason })));
+    }
+    return { changed, notMoved };
+  }
+  throw httpError(400, 'Unknown action');
+}
+
+async function customersByIds(ids) {
+  const { rows } = await pool.query(
+    `SELECT ${SELECT_ROW} FROM customers cu LEFT JOIN stores s ON s.id = cu.store_id WHERE cu.id = ANY($1)
+      ORDER BY cu.last_seen_at DESC NULLS LAST, cu.id DESC`, [ids]);
+  return rows;
+}
+
 // A store's domain changed: its customers and their history follow.
 async function moveStoreDomain(client, storeId, newDomain) {
   const domain = cleanDomain(newDomain);
@@ -203,5 +278,5 @@ async function waitingForStore() {
 
 module.exports = {
   listCustomers, listAudience, getCustomer, storeHistory, addCustomer, updateCustomer, setStatus, deleteCustomer,
-  moveStoreDomain, linkUnmatched, waitingForStore,
+  moveStoreDomain, linkUnmatched, waitingForStore, resolveSelection, batchCustomers, customersByIds,
 };

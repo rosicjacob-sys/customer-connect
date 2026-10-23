@@ -116,10 +116,16 @@ function mergeCustomer(existing, links, rows, now = new Date()) {
   return { customer: c, links: all.filter((l) => l._touched), isNew: !existing, storeChanged };
 }
 
+// Domain → store, including domains assigned to a store (store_aliases).
+// A store's own domain always wins over an assignment.
 async function loadStores(client = pool) {
-  const { rows } = await client.query('SELECT id, domain, brand_name FROM stores');
+  const [{ rows }, { rows: aliases }] = await Promise.all([
+    client.query('SELECT id, domain, brand_name FROM stores'),
+    client.query(`SELECT a.domain AS alias, s.id, s.domain, s.brand_name FROM store_aliases a JOIN stores s ON s.id = a.store_id`),
+  ]);
   const map = new Map();
   for (const s of rows) map.set(rules.matchDomain(s.domain), s);
+  for (const { alias, ...s } of aliases) if (!map.has(rules.matchDomain(alias))) map.set(rules.matchDomain(alias), s);
   return map;
 }
 
@@ -256,4 +262,4 @@ async function ingest(rawRows, { source, apply = true, unknownStores = 'keep', l
   return report;
 }
 
-module.exports = { ingest, mergeCustomer, SOURCE_RANK };
+module.exports = { ingest, mergeCustomer, SOURCE_RANK, INGEST_LOCK };

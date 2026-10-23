@@ -2,6 +2,7 @@
 //   /api/templates …              saved templates (CRUD), scoped per store group
 //   POST /api/test-send           one email to one address, as a given store
 //   /api/campaigns …              list, detail, create, edit, pause/resume/stop, delete
+//   POST /api/templates/batch, /api/campaigns/batch   the same on several at once
 
 const express = require('express');
 const { pool } = require('../db');
@@ -10,7 +11,7 @@ const { EMAIL_RE, movedBanner } = require('../lib/merge');
 const { sendToRecipient } = require('../services/sender');
 const campaigns = require('../services/campaigns');
 const worker = require('../services/worker');
-const { wrap, httpError, idParam, str } = require('./util');
+const { wrap, httpError, idParam, str, intList } = require('./util');
 
 const router = express.Router();
 router.use(['/templates', '/test-send', '/campaigns'], requireAuth);
@@ -69,6 +70,14 @@ router.delete('/templates/:id', wrap(async (req, res) => {
   res.json({ deleted: true });
 }));
 
+router.post('/templates/batch', wrap(async (req, res) => {
+  const ids = intList(req.body?.ids) || [];
+  if (req.body?.action !== 'delete') throw httpError(400, 'Unknown action');
+  if (!ids.length) throw httpError(400, 'Pick at least one template');
+  const { rowCount } = await pool.query('DELETE FROM templates WHERE id = ANY($1)', [ids]);
+  res.json({ changed: rowCount });
+}));
+
 // ── Test send ───────────────────────────────────────────────────────────────
 
 // Sends the content to one address as if it came from the chosen store:
@@ -107,6 +116,29 @@ router.post('/test-send', wrap(async (req, res) => {
 
 router.get('/campaigns', wrap(async (req, res) => {
   res.json(await campaigns.listCampaigns({ storeGroup: str(req.query.storeGroup) }));
+}));
+
+// Each campaign is changed on its own; ones that can't take the action
+// (e.g. resuming one that isn't paused) are listed with the reason.
+router.post('/campaigns/batch', wrap(async (req, res) => {
+  const ids = intList(req.body?.ids) || [];
+  const action = String(req.body?.action || '');
+  if (!['pause', 'resume', 'cancel', 'delete'].includes(action)) throw httpError(400, 'Unknown action');
+  if (!ids.length) throw httpError(400, 'Pick at least one campaign');
+  let changed = 0;
+  const skipped = [];
+  for (const id of ids) {
+    try {
+      if (action === 'delete') await campaigns.deleteCampaign(id);
+      else await campaigns.changeStatus(id, action);
+      changed++;
+    } catch (err) {
+      if (!err.status) throw err;
+      skipped.push({ id, reason: err.message });
+    }
+  }
+  if (action === 'resume' && changed) worker.kick();
+  res.json({ changed, skipped });
 }));
 
 router.get('/campaigns/:id', wrap(async (req, res) => {

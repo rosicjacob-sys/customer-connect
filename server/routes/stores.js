@@ -4,6 +4,9 @@
 //   POST   /api/stores  PUT /api/stores/:id  DELETE /api/stores/:id
 //   POST   /api/stores/bulk              add several stores (e.g. the ones a CSV named)
 //   GET    /api/stores/waiting           store domains customers were saved under, not set up yet
+//   POST   /api/stores/assign            give those domains (and their customers) to an existing store
+//   DELETE /api/stores/aliases/:domain   stop sending that domain's new customers to the store
+//   POST   /api/stores/batch             one action on several stores (segment, group, country, active, merge, delete)
 //   GET    /api/segments?storeGroup=     saved store sets + "Others"
 //   PUT    /api/segments                 create (no id) or replace one
 //   DELETE /api/segments/:id
@@ -13,6 +16,7 @@ const { pool, transaction } = require('../db');
 const { requireAuth } = require('../auth');
 const { EMAIL_RE, cleanDomain } = require('../lib/merge');
 const customers = require('../services/customers');
+const storeMoves = require('../services/storeMoves');
 const { wrap, httpError, idParam, str, intList } = require('./util');
 
 const router = express.Router();
@@ -32,6 +36,7 @@ const serializeStore = (s) => ({
   isActive: s.is_active,
   fromChatSupport: s.csp_store_id != null,
   customerCount: s.customer_count != null ? Number(s.customer_count) : undefined,
+  aliases: s.aliases || [],
 });
 
 router.get('/groups', wrap(async (req, res) => {
@@ -44,7 +49,8 @@ router.get('/groups', wrap(async (req, res) => {
 router.get('/stores', wrap(async (req, res) => {
   const group = str(req.query.storeGroup);
   const { rows } = await pool.query(`
-    SELECT s.*, (SELECT COUNT(*) FROM customers c WHERE c.store_id = s.id) AS customer_count
+    SELECT s.*, (SELECT COUNT(*) FROM customers c WHERE c.store_id = s.id) AS customer_count,
+           ARRAY(SELECT a.domain FROM store_aliases a WHERE a.store_id = s.id ORDER BY a.domain) AS aliases
       FROM stores s ${group ? 'WHERE s.store_group = $1' : ''}
      ORDER BY s.store_group NULLS LAST, LOWER(s.brand_name)`, group ? [group] : []);
   res.json(rows.map(serializeStore));
@@ -95,6 +101,7 @@ router.post('/stores', wrap(async (req, res) => {
     const { rows: [row] } = await pool.query(
       `INSERT INTO stores (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
       Object.values(s));
+    await storeMoves.dropAliasesFor([row.domain]);
     await customers.linkUnmatched();
     res.status(201).json(serializeStore(row));
   } catch (err) {
@@ -124,12 +131,74 @@ router.post('/stores/bulk', wrap(async (req, res) => {
        ON CONFLICT (domain) DO NOTHING RETURNING *`, Object.values(s));
     if (row) added.push(serializeStore(row)); else skipped.push({ domain: s.domain, reason: 'already exists' });
   }
+  if (added.length) await storeMoves.dropAliasesFor(added.map((s) => s.domain));
   const linked = await customers.linkUnmatched();
   res.status(201).json({ added, skipped, customersLinked: linked });
 }));
 
 router.get('/stores/waiting', wrap(async (req, res) => {
   res.json(await customers.waitingForStore());
+}));
+
+router.post('/stores/assign', wrap(async (req, res) => {
+  const storeId = parseInt(req.body?.storeId, 10);
+  if (!Number.isFinite(storeId)) throw httpError(400, 'Pick the store to assign them to');
+  const domains = Array.isArray(req.body?.domains) ? req.body.domains : [];
+  const result = await storeMoves.assignDomains({ domains, storeId, createdBy: req.user.email });
+  console.log(`[stores] ${req.user.email} assigned ${result.domains.join(', ')} to ${result.store} (${result.customersMoved} customers)`);
+  res.json(result);
+}));
+
+router.delete('/stores/aliases/:domain', wrap(async (req, res) => {
+  if (!(await storeMoves.removeAlias(req.params.domain))) throw httpError(404, 'No such rule');
+  res.json({ deleted: true });
+}));
+
+// One action on several stores. Stores copied from Chat Support Pro get
+// their group, country and active flag back from it on the next sync, and
+// come back if deleted; merging them sticks (the sync skips merged domains).
+router.post('/stores/batch', wrap(async (req, res) => {
+  const ids = intList(req.body?.ids) || [];
+  const action = String(req.body?.action || '');
+  if (!ids.length) throw httpError(400, 'Pick at least one store');
+  const b = req.body;
+  let changed = 0;
+  if (action === 'segment-add' || action === 'segment-remove') {
+    let segmentId = parseInt(b.segmentId, 10);
+    if (action === 'segment-add' && !Number.isFinite(segmentId)) {
+      const name = String(b.segmentName || '').trim();
+      if (!name) throw httpError(400, 'Pick a segment or name a new one');
+      if (name.toLowerCase() === 'others') throw httpError(400, '"Others" is kept for stores that are in no segment');
+      const { rows: [seg] } = await pool.query(
+        `INSERT INTO segments (name) VALUES ($1) ON CONFLICT ((LOWER(name))) DO UPDATE SET updated_at = NOW() RETURNING id`, [name]);
+      segmentId = seg.id;
+    }
+    if (!Number.isFinite(segmentId)) throw httpError(400, 'Pick a segment');
+    changed = (action === 'segment-add'
+      ? await pool.query(`INSERT INTO segment_stores (segment_id, store_id) SELECT $1, id FROM stores WHERE id = ANY($2) ON CONFLICT DO NOTHING`, [segmentId, ids])
+      : await pool.query('DELETE FROM segment_stores WHERE segment_id = $1 AND store_id = ANY($2)', [segmentId, ids])).rowCount;
+    return res.json({ changed, segmentId });
+  }
+  if (action === 'group' || action === 'country') {
+    const s = readStoreBody(action === 'group' ? { storeGroup: b.storeGroup, storeGroupName: b.storeGroupName } : { country: b.country }, { partial: true });
+    const cols = Object.keys(s);
+    changed = (await pool.query(
+      `UPDATE stores SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(', ')}, updated_at = NOW() WHERE id = ANY($1)`,
+      [ids, ...Object.values(s)])).rowCount;
+  } else if (action === 'activate' || action === 'deactivate') {
+    changed = (await pool.query('UPDATE stores SET is_active = $2, updated_at = NOW() WHERE id = ANY($1)', [ids, action === 'activate'])).rowCount;
+  } else if (action === 'merge') {
+    const targetId = parseInt(b.targetId, 10);
+    if (!Number.isFinite(targetId)) throw httpError(400, 'Pick the store to keep');
+    const result = await storeMoves.mergeStores({ ids, targetId, createdBy: req.user.email });
+    console.log(`[stores] ${req.user.email} merged ${result.merged.join(', ')} into ${result.into} (${result.customersMoved} customers)`);
+    return res.json({ changed: result.merged.length, ...result });
+  } else if (action === 'delete') {
+    changed = (await pool.query('DELETE FROM stores WHERE id = ANY($1)', [ids])).rowCount;
+  } else {
+    throw httpError(400, 'Unknown action');
+  }
+  res.json({ changed });
 }));
 
 // Changing the domain moves the store's customers to it.
@@ -144,7 +213,10 @@ router.put('/stores/:id', wrap(async (req, res) => {
     const { rows: [after] } = await client.query(
       `UPDATE stores SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(', ')}, updated_at = NOW() WHERE id = $1 RETURNING *`,
       [id, ...Object.values(s)]);
-    if (s.domain && s.domain !== before.domain) await customers.moveStoreDomain(client, id, s.domain);
+    if (s.domain && s.domain !== before.domain) {
+      await customers.moveStoreDomain(client, id, s.domain);
+      await storeMoves.dropAliasesFor([s.domain], client);
+    }
     return after;
   }).catch((err) => {
     if (err.code === '23505') throw httpError(409, 'Another store already uses that domain');
